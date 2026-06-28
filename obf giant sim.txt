@@ -1,0 +1,902 @@
+local Workspace    = game:GetService("Workspace")
+local Players      = game:GetService("Players")
+local UIS          = game:GetService("UserInputService")
+local CoreGui      = game:GetService("CoreGui")
+local TweenService = game:GetService("TweenService")
+local RunService   = game:GetService("RunService")
+
+local player    = Players.LocalPlayer
+local pGui      = player:WaitForChild("PlayerGui")
+
+local scene         = Workspace:WaitForChild("Scene"):WaitForChild("Minefield")
+local cells         = scene:WaitForChild("Cells")
+local raceBlocker   = scene:WaitForChild("RaceBlocker")
+local endRacePart   = scene:WaitForChild("EndRace")
+local playerSpawnPart = scene:WaitForChild("PlayerSpawn")
+
+local uiGridMatrix       = {}
+local activeEsps         = {}
+local activePathLines    = {}
+local logicalGrid        = {}
+
+local radarEnabled           = true
+local espEnabled             = true
+local botRunning             = false
+local playerIsStunned        = false
+local wasBotRunningBeforeBlock = false
+
+local TWEEN_SPEED     = 0.18
+local TWEEN_MIN       = 0.08
+local TWEEN_MAX       = 0.50
+
+local playerMarkerFrame = nil
+local statusLabel       = nil
+local coordLabel        = nil
+local speedLabel        = nil
+
+local function getPart(tile)
+    if not tile then return nil end
+    return tile:FindFirstChild("Button")
+        or (tile:IsA("BasePart") and tile)
+        or tile.PrimaryPart
+end
+
+local function getRowTiles(rowNum)
+    local row = cells:FindFirstChild("Row" .. rowNum)
+    if not row then return nil end
+    local tiles = row:GetChildren()
+    table.sort(tiles, function(a, b)
+        local pa, pb = getPart(a), getPart(b)
+        if pa and pb then return pa.Position.X > pb.Position.X end
+        return (tonumber(a.Name) or 0) < (tonumber(b.Name) or 0)
+    end)
+    return tiles
+end
+
+local function resetLogicalGrid()
+    for r = 1, 20 do
+        logicalGrid[r] = {}
+        for t = 1, 10 do
+            logicalGrid[r][t] = "UNKNOWN"
+            if uiGridMatrix[r] and uiGridMatrix[r][t] then
+                uiGridMatrix[r][t].BackgroundColor3 = Color3.fromRGB(12, 12, 15)
+            end
+        end
+    end
+end
+
+local function getPlayerGridPosition()
+    local char = player.Character
+    if not char then return nil, nil end
+    local hrp = char:FindFirstChild("HumanoidRootPart")
+    if not hrp then return nil, nil end
+
+    local playerPos  = hrp.Position
+    local minDist    = math.huge
+    local bestR, bestT = nil, nil
+
+    for r = 1, 20 do
+        local tiles = getRowTiles(r)
+        if tiles then
+            for t, tile in ipairs(tiles) do
+                local part = getPart(tile)
+                if part then
+                    local d = (part.Position - playerPos).Magnitude
+                    if d < minDist and d < 12 then
+                        minDist = d
+                        bestR, bestT = r, t
+                    end
+                end
+            end
+        end
+    end
+    return bestR, bestT
+end
+
+task.spawn(function()
+    while radarEnabled do
+        local char = player.Character
+        if char then
+            local hum = char:FindFirstChildOfClass("Humanoid")
+            local hrp = char:FindFirstChild("HumanoidRootPart")
+            if hum and hrp then
+                local state   = hum:GetState()
+                local vel     = hrp.AssemblyLinearVelocity.Magnitude
+                local flying  = vel > 40
+                if state == Enum.HumanoidStateType.Dead
+                or state == Enum.HumanoidStateType.Physics
+                or flying then
+                    if not playerIsStunned then
+                        playerIsStunned = true
+                        if activeTween then activeTween:Cancel() activeTween = nil end
+                    end
+                else
+                    if playerIsStunned and vel < 4
+                    and state ~= Enum.HumanoidStateType.Physics then
+                        task.wait(0.4)
+                        playerIsStunned = false
+                    end
+                end
+            end
+        end
+        task.wait(0.05)
+    end
+end)
+
+local activeTween = nil
+
+local function tweenTo(hrp, targetCFrame, duration)
+    if activeTween then
+        activeTween:Cancel()
+        activeTween = nil
+    end
+    local info  = TweenInfo.new(duration, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
+    local tween = TweenService:Create(hrp, info, { CFrame = targetCFrame })
+    activeTween = tween
+    tween:Play()
+    tween.Completed:Wait()
+    activeTween = nil
+end
+
+local function tweenAndResetRace()
+    local char = player.Character
+    local hrp  = char and char:FindFirstChild("HumanoidRootPart")
+    if not (hrp and endRacePart) then return end
+
+    if activeTween then activeTween:Cancel() activeTween = nil end
+
+    hrp.AssemblyLinearVelocity = Vector3.zero
+
+    local info  = TweenInfo.new(0.35, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
+    local tween = TweenService:Create(hrp, info, {
+        CFrame = endRacePart.CFrame * CFrame.new(0, 3.5, 0)
+    })
+    tween:Play()
+    tween.Completed:Wait()
+
+    task.wait(0.15)
+
+    if playerSpawnPart and hrp then
+        hrp.CFrame = playerSpawnPart.CFrame * CFrame.new(0, 3.5, 0)
+        hrp.AssemblyLinearVelocity = Vector3.zero
+    end
+end
+
+local function scanEnvironment()
+    if playerIsStunned then return end
+    if raceBlocker and raceBlocker.CanCollide then return end
+
+    for r = 1, 20 do
+        local tiles = getRowTiles(r)
+        if tiles then
+            for t, tile in ipairs(tiles) do
+                local part = getPart(tile)
+                if part then
+                    local bColor = part.BrickColor.Name
+                    local col    = part.Color
+                    local trans  = part.Transparency
+                    local old    = logicalGrid[r][t]
+                    local nuovo
+
+                    if bColor:find("Green") or bColor:find("Lime")
+                    or (col.G > 0.5 and col.R < 0.5) then
+                        nuovo = "GREEN"
+                    elseif bColor:find("Red")
+                    or (col.R > 0.5 and col.G < 0.5)
+                    or trans > 0.5 then
+                        nuovo = "RED"
+                    else
+                        nuovo = "UNKNOWN"
+                    end
+
+                    logicalGrid[r][t] = nuovo
+
+                    if uiGridMatrix[r] and uiGridMatrix[r][t] and nuovo ~= old then
+                        local frame = uiGridMatrix[r][t]
+                        if nuovo == "GREEN" then
+                            frame.BackgroundColor3 = Color3.fromRGB(0, 200, 80)
+                        elseif nuovo == "RED" then
+                            frame.BackgroundColor3 = Color3.fromRGB(230, 40, 40)
+                        else
+                            frame.BackgroundColor3 = Color3.fromRGB(12, 12, 15)
+                        end
+                    end
+                end
+            end
+        end
+    end
+end
+
+local function calculateSmartPath(fromR, fromT)
+    fromR = fromR or 1
+    fromT = fromT or 1
+
+    local dist   = {}
+    local parent = {}
+    local visited = {}
+
+    for r = 1, 20 do
+        dist[r]    = {}
+        parent[r]  = {}
+        visited[r] = {}
+        for t = 1, 10 do
+            dist[r][t]    = math.huge
+            visited[r][t] = false
+        end
+    end
+
+    dist[fromR][fromT] = 0
+    local queue = { {r = fromR, t = fromT, d = 0} }
+
+    local dirs = {
+        {1,  0}, {1, -1}, {1,  1},
+        {0, -1}, {0,  1},
+        {-1, 0}, {-1,-1}, {-1, 1},
+    }
+
+    while #queue > 0 do
+        local minIdx, minD = 1, queue[1].d
+        for i = 2, #queue do
+            if queue[i].d < minD then minIdx = i; minD = queue[i].d end
+        end
+        local u = table.remove(queue, minIdx)
+
+        if visited[u.r][u.t] then continue end
+        visited[u.r][u.t] = true
+
+        for _, d in ipairs(dirs) do
+            local nr, nt = u.r + d[1], u.t + d[2]
+            if nr >= 1 and nr <= 20 and nt >= 1 and nt <= 10
+            and not visited[nr][nt]
+            and logicalGrid[nr][nt] ~= "RED" then
+
+                local w = (logicalGrid[nr][nt] == "GREEN") and 1 or 5000
+                if d[1] <= 0 then w = w + 10 end
+
+                local alt = dist[u.r][u.t] + w
+                if alt < dist[nr][nt] then
+                    dist[nr][nt] = alt
+                    parent[nr][nt] = {r = u.r, t = u.t}
+                    table.insert(queue, {r = nr, t = nt, d = alt})
+                end
+            end
+        end
+    end
+
+    local bestR, bestT, bestD = 20, 1, math.huge
+    for t = 1, 10 do
+        if dist[20][t] < bestD then bestD = dist[20][t]; bestT = t end
+    end
+    if bestD == math.huge then
+        for r = 19, fromR + 1, -1 do
+            for t = 1, 10 do
+                if dist[r][t] < bestD then bestD = dist[r][t]; bestR = r; bestT = t end
+            end
+            if bestD < math.huge then break end
+        end
+    end
+    if bestD == math.huge then return {} end
+
+    local path = {}
+    local cur  = {r = bestR, t = bestT}
+    local safety = 0
+    while cur do
+        table.insert(path, 1, cur)
+        local p = parent[cur.r][cur.t]
+        cur = p
+        safety = safety + 1
+        if safety > 400 then break end
+    end
+    return path
+end
+
+local function setStatus(text, color)
+    if statusLabel then
+        statusLabel.Text   = text
+        statusLabel.TextColor3 = color or Color3.fromRGB(200, 200, 200)
+    end
+end
+
+local function setCoord(r, t)
+    if coordLabel then
+        if r then
+            coordLabel.Text = string.format("Pos: R%d T%d", r, t)
+        else
+            coordLabel.Text = "Pos: --"
+        end
+    end
+end
+
+local function findBestStartNode()
+    for r = 1, 20 do
+        for t = 1, 10 do
+            if logicalGrid[r][t] == "GREEN" then
+                return r, t
+            end
+        end
+    end
+    return 1, 1
+end
+
+local function tweenToNode(hrp, r, t)
+    local tiles = getRowTiles(r)
+    local part  = tiles and tiles[t] and getPart(tiles[t])
+    if part then
+        tweenTo(hrp, CFrame.new(part.Position + Vector3.new(0, 3, 0)), TWEEN_SPEED)
+    end
+end
+
+local function walkToNode(hrp, humanoid, r, t)
+    local tiles = getRowTiles(r)
+    local part  = tiles and tiles[t] and getPart(tiles[t])
+    if not part then return end
+    humanoid.WalkSpeed = 80
+    humanoid:MoveTo(part.Position)
+    local timeout = 0
+    while (hrp.Position - part.Position).Magnitude > 3.5 and timeout < 400 do
+        if not botRunning or playerIsStunned or (raceBlocker and raceBlocker.CanCollide) then break end
+        task.wait(0.02)
+        timeout = timeout + 1
+    end
+end
+
+local function runAutoComplete()
+    local char     = player.Character or player.CharacterAdded:Wait()
+    local hrp      = char:WaitForChild("HumanoidRootPart")
+    local humanoid = char:WaitForChild("Humanoid")
+
+    setStatus("Scanning...", Color3.fromRGB(255, 200, 50))
+    scanEnvironment()
+
+    task.wait(0.5)
+
+    local r1candidates = {}
+    for t = 1, 10 do
+        if logicalGrid[1][t] ~= "RED" then
+            table.insert(r1candidates, t)
+        end
+    end
+    local startT = r1candidates[math.random(1, #r1candidates > 0 and #r1candidates or 1)] or 1
+    local startR = 1
+    local currentR, currentT = startR, startT
+
+    setStatus("Walking to R1 T"..startT.."...", Color3.fromRGB(255, 200, 50))
+    walkToNode(hrp, humanoid, startR, startT)
+    scanEnvironment()
+
+    setStatus("BOT ACTIVE", Color3.fromRGB(50, 220, 100))
+
+    while botRunning and currentR <= 20 do
+
+        if raceBlocker and raceBlocker.CanCollide then break end
+
+        if playerIsStunned then
+            setStatus("Stunned! Waiting for landing...", Color3.fromRGB(255, 80, 80))
+
+            while playerIsStunned and botRunning do
+                task.wait(0.1)
+            end
+
+            if not botRunning then break end
+
+            setStatus("Rescanning after stun...", Color3.fromRGB(255, 160, 30))
+            task.wait(0.2)
+            scanEnvironment()
+
+            local newStartR, newStartT = findBestStartNode()
+            currentR, currentT = newStartR, newStartT
+
+            setStatus("Restarting from R"..newStartR.." T"..newStartT.."...", Color3.fromRGB(255, 200, 50))
+            tweenToNode(hrp, newStartR, newStartT)
+            scanEnvironment()
+
+            setStatus("BOT ACTIVE", Color3.fromRGB(50, 220, 100))
+            continue
+        end
+
+        setCoord(currentR, currentT)
+
+        if currentR == 20 and endRacePart then
+            setStatus("Row 20! Tweening to EndRace...", Color3.fromRGB(0, 255, 150))
+            if activeTween then activeTween:Cancel() activeTween = nil end
+            hrp.AssemblyLinearVelocity = Vector3.zero
+
+            local info  = TweenInfo.new(0.35, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
+            local tween = TweenService:Create(hrp, info, {
+                CFrame = endRacePart.CFrame * CFrame.new(0, 3.5, 0)
+            })
+            tween:Play()
+            tween.Completed:Wait()
+
+            local won = false
+            for _ = 1, 15 do
+                if raceBlocker and raceBlocker.CanCollide then
+                    won = true
+                    break
+                end
+                task.wait(0.1)
+            end
+
+            if won then
+                setStatus("Victory! Waiting for new round...", Color3.fromRGB(0, 255, 150))
+                break
+            else
+                setStatus("Not confirmed, resuming path...", Color3.fromRGB(255, 160, 30))
+                scanEnvironment()
+                local pR, pT = getPlayerGridPosition()
+                if pR then currentR, currentT = pR, pT end
+            end
+        end
+
+        local path = calculateSmartPath(currentR, currentT)
+
+        if #path < 2 then
+            setStatus("Path not found", Color3.fromRGB(255, 80, 80))
+            task.wait(0.3)
+            scanEnvironment()
+            continue
+        end
+
+        local nextNode = path[2]
+
+        local targetTiles = getRowTiles(nextNode.r)
+        local targetTile  = targetTiles and targetTiles[nextNode.t]
+        local part        = targetTile and getPart(targetTile)
+
+        if not part then
+            task.wait(0.1)
+            continue
+        end
+
+        local targetCF = CFrame.new(part.Position + Vector3.new(0, 3, 0))
+        hrp.AssemblyLinearVelocity = Vector3.zero
+
+        local tweenDone       = false
+        local tweenInterrupted = false
+        task.spawn(function()
+            tweenTo(hrp, targetCF, TWEEN_SPEED)
+            tweenDone = true
+        end)
+
+        local elapsed = 0
+        while not tweenDone do
+            if playerIsStunned or not botRunning or (raceBlocker and raceBlocker.CanCollide) then
+                if activeTween then activeTween:Cancel() activeTween = nil end
+                tweenInterrupted = true
+                break
+            end
+            task.wait(0.016)
+            elapsed = elapsed + 0.016
+            if elapsed > TWEEN_SPEED + 0.5 then break end
+        end
+
+        if not botRunning then break end
+
+        if tweenInterrupted then
+            task.wait(0.05)
+            continue
+        end
+
+        task.wait(0.05)
+        if playerIsStunned then continue end
+
+        scanEnvironment()
+
+        local tileState = logicalGrid[nextNode.r][nextNode.t]
+        if tileState == "RED" then
+            logicalGrid[nextNode.r][nextNode.t] = "RED"
+            setStatus("Dangerous tile! Backtracking...", Color3.fromRGB(255, 120, 30))
+
+            local prevTiles = getRowTiles(currentR)
+            local prevPart  = prevTiles and prevTiles[currentT] and getPart(prevTiles[currentT])
+            if prevPart then
+                tweenTo(hrp, CFrame.new(prevPart.Position + Vector3.new(0, 3, 0)), TWEEN_SPEED * 0.8)
+            end
+            task.wait(0.15)
+            scanEnvironment()
+        else
+            currentR, currentT = nextNode.r, nextNode.t
+        end
+
+        task.wait(0.02)
+    end
+
+    if not botRunning and not wasBotRunningBeforeBlock then
+        botBtn.BackgroundColor3 = Color3.fromRGB(30, 30, 38)
+        botStroke.Color         = Color3.fromRGB(60, 60, 70)
+        botBtn.Text             = "START BOT"
+        botBtn.TextColor3       = Color3.fromRGB(180, 180, 180)
+        setStatus("Bot stopped", Color3.fromRGB(150, 150, 150))
+    end
+end
+
+local function drawGuiLine(frameA, frameB, parent)
+    if not frameA or not frameB then return end
+    local ax = frameA.Position.X.Offset + frameA.Size.X.Offset / 2
+    local ay = frameA.Position.Y.Offset + frameA.Size.Y.Offset / 2
+    local bx = frameB.Position.X.Offset + frameB.Size.X.Offset / 2
+    local by = frameB.Position.Y.Offset + frameB.Size.Y.Offset / 2
+
+    local dist  = math.sqrt((bx - ax)^2 + (by - ay)^2)
+    local angle = math.deg(math.atan2(by - ay, bx - ax))
+
+    local line = Instance.new("Frame")
+    line.Size            = UDim2.new(0, dist, 0, 2)
+    line.Position        = UDim2.new(0, (ax + bx) / 2 - dist / 2, 0, (ay + by) / 2 - 1)
+    line.Rotation        = angle
+    line.BackgroundColor3 = Color3.fromRGB(0, 195, 255)
+    line.BorderSizePixel = 0
+    line.ZIndex          = 6
+    line.Parent          = parent
+    table.insert(activePathLines, line)
+end
+
+local function clearPathLines()
+    for _, l in ipairs(activePathLines) do pcall(function() l:Destroy() end) end
+    table.clear(activePathLines)
+end
+
+local function updateESP3D()
+    for _, obj in ipairs(activeEsps) do pcall(function() obj:Destroy() end) end
+    table.clear(activeEsps)
+    if not espEnabled or (raceBlocker and raceBlocker.CanCollide) then return end
+
+    for r = 1, 20 do
+        local tiles = getRowTiles(r)
+        if tiles then
+            for t, tile in ipairs(tiles) do
+                local part = getPart(tile)
+                if part then
+                    local bb  = Instance.new("BillboardGui", part)
+                    bb.Size          = UDim2.new(0, 56, 0, 22)
+                    bb.AlwaysOnTop   = true
+                    bb.ExtentsOffset = Vector3.new(0, 2.5, 0)
+
+                    local txt = Instance.new("TextLabel", bb)
+                    txt.Size               = UDim2.new(1, 0, 1, 0)
+                    txt.BackgroundTransparency = 1
+                    txt.TextColor3         = Color3.new(1, 1, 1)
+                    txt.TextSize           = 11
+                    txt.Font               = Enum.Font.GothamBold
+                    txt.Text               = "R" .. r .. " T" .. t
+
+                    local stroke = Instance.new("UIStroke", txt)
+                    stroke.Color = (r % 2 == 0)
+                        and Color3.new(0, 1, 0.4)
+                        or  Color3.new(0, 0.8, 1)
+
+                    table.insert(activeEsps, bb)
+                end
+            end
+        end
+    end
+end
+
+local guiParent = CoreGui:FindFirstChild("RobloxGui") or pGui
+local gui = Instance.new("ScreenGui", guiParent)
+gui.Name          = "MinefieldMasterAI_v3"
+gui.ResetOnSpawn  = false
+gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+
+local mainFrame = Instance.new("Frame", gui)
+mainFrame.Size            = UDim2.new(0, 248, 0, 570)
+mainFrame.Position        = UDim2.new(0.78, 0, 0.12, 0)
+mainFrame.BackgroundColor3 = Color3.fromRGB(16, 16, 20)
+mainFrame.BorderSizePixel = 0
+mainFrame.Active          = true
+Instance.new("UICorner", mainFrame).CornerRadius = UDim.new(0, 10)
+local mainStroke = Instance.new("UIStroke", mainFrame)
+mainStroke.Color     = Color3.fromRGB(50, 50, 60)
+mainStroke.Thickness = 1.2
+
+local title = Instance.new("TextLabel", mainFrame)
+title.Size               = UDim2.new(1, -36, 0, 30)
+title.Position           = UDim2.new(0, 10, 0, 4)
+title.BackgroundTransparency = 1
+title.Text               = "Mine Race"
+title.TextColor3         = Color3.fromRGB(0, 210, 255)
+title.Font               = Enum.Font.GothamBold
+title.TextSize           = 12
+title.TextXAlignment     = Enum.TextXAlignment.Left
+
+local closeBtn = Instance.new("TextButton", mainFrame)
+closeBtn.Size             = UDim2.new(0, 22, 0, 22)
+closeBtn.Position         = UDim2.new(1, -28, 0, 4)
+closeBtn.BackgroundColor3 = Color3.fromRGB(160, 40, 40)
+closeBtn.Text             = "×"
+closeBtn.TextColor3       = Color3.new(1, 1, 1)
+closeBtn.Font             = Enum.Font.GothamBold
+closeBtn.TextSize         = 14
+Instance.new("UICorner", closeBtn).CornerRadius = UDim.new(0, 5)
+
+local sep = Instance.new("Frame", mainFrame)
+sep.Size              = UDim2.new(1, -20, 0, 1)
+sep.Position          = UDim2.new(0, 10, 0, 32)
+sep.BackgroundColor3  = Color3.fromRGB(45, 45, 55)
+sep.BorderSizePixel   = 0
+
+statusLabel = Instance.new("TextLabel", mainFrame)
+statusLabel.Size               = UDim2.new(1, -20, 0, 18)
+statusLabel.Position           = UDim2.new(0, 10, 0, 36)
+statusLabel.BackgroundTransparency = 1
+statusLabel.Text               = "Waiting..."
+statusLabel.TextColor3         = Color3.fromRGB(160, 160, 160)
+statusLabel.Font               = Enum.Font.GothamMedium
+statusLabel.TextSize           = 10
+statusLabel.TextXAlignment     = Enum.TextXAlignment.Left
+
+coordLabel = Instance.new("TextLabel", mainFrame)
+coordLabel.Size               = UDim2.new(1, -20, 0, 16)
+coordLabel.Position           = UDim2.new(0, 10, 0, 52)
+coordLabel.BackgroundTransparency = 1
+coordLabel.Text               = "Pos: --"
+coordLabel.TextColor3         = Color3.fromRGB(120, 120, 130)
+coordLabel.Font               = Enum.Font.Gotham
+coordLabel.TextSize           = 9
+coordLabel.TextXAlignment     = Enum.TextXAlignment.Left
+
+local espBtn = Instance.new("TextButton", mainFrame)
+espBtn.Size             = UDim2.new(0, 108, 0, 28)
+espBtn.Position         = UDim2.new(0, 10, 0, 72)
+espBtn.BackgroundColor3 = Color3.fromRGB(0, 90, 130)
+espBtn.Text             = "ESP 3D: ON"
+espBtn.TextColor3       = Color3.new(1, 1, 1)
+espBtn.Font             = Enum.Font.GothamMedium
+espBtn.TextSize         = 11
+Instance.new("UICorner", espBtn).CornerRadius = UDim.new(0, 6)
+Instance.new("UIStroke", espBtn).Color = Color3.fromRGB(0, 160, 220)
+
+local botBtn = Instance.new("TextButton", mainFrame)
+botBtn.Size             = UDim2.new(0, 108, 0, 28)
+botBtn.Position         = UDim2.new(0, 128, 0, 72)
+botBtn.BackgroundColor3 = Color3.fromRGB(30, 30, 38)
+botBtn.Text             = "START BOT"
+botBtn.TextColor3       = Color3.fromRGB(180, 180, 180)
+botBtn.Font             = Enum.Font.GothamMedium
+botBtn.TextSize         = 11
+Instance.new("UICorner", botBtn).CornerRadius = UDim.new(0, 6)
+local botStroke = Instance.new("UIStroke", botBtn)
+botStroke.Color = Color3.fromRGB(60, 60, 70)
+
+speedLabel = Instance.new("TextLabel", mainFrame)
+speedLabel.Size               = UDim2.new(1, -20, 0, 14)
+speedLabel.Position           = UDim2.new(0, 10, 0, 104)
+speedLabel.BackgroundTransparency = 1
+speedLabel.Text               = string.format("Tween Speed: %.2fs/step", TWEEN_SPEED)
+speedLabel.TextColor3         = Color3.fromRGB(120, 120, 140)
+speedLabel.Font               = Enum.Font.Gotham
+speedLabel.TextSize           = 9
+speedLabel.TextXAlignment     = Enum.TextXAlignment.Left
+
+local function makeSpeedBtn(label, posX, delta)
+    local btn = Instance.new("TextButton", mainFrame)
+    btn.Size             = UDim2.new(0, 36, 0, 20)
+    btn.Position         = UDim2.new(0, posX, 0, 120)
+    btn.BackgroundColor3 = Color3.fromRGB(35, 35, 48)
+    btn.Text             = label
+    btn.TextColor3       = Color3.fromRGB(200, 200, 200)
+    btn.Font             = Enum.Font.GothamBold
+    btn.TextSize         = 11
+    Instance.new("UICorner", btn).CornerRadius = UDim.new(0, 4)
+    btn.MouseButton1Click:Connect(function()
+        TWEEN_SPEED = math.clamp(TWEEN_SPEED + delta, TWEEN_MIN, TWEEN_MAX)
+        speedLabel.Text = string.format("Tween Speed: %.2fs/step", TWEEN_SPEED)
+    end)
+    return btn
+end
+makeSpeedBtn("− Slow", 10,  0.02)
+makeSpeedBtn("⬛ Reset", 52,  0)
+makeSpeedBtn("Fast +", 94, -0.02)
+
+do
+    local rBtn = Instance.new("TextButton", mainFrame)
+    rBtn.Size             = UDim2.new(0, 36, 0, 20)
+    rBtn.Position         = UDim2.new(0, 52, 0, 120)
+    rBtn.BackgroundColor3 = Color3.fromRGB(50, 50, 65)
+    rBtn.Text             = "RST"
+    rBtn.TextColor3       = Color3.fromRGB(180, 180, 200)
+    rBtn.Font             = Enum.Font.GothamMedium
+    rBtn.TextSize         = 9
+    Instance.new("UICorner", rBtn).CornerRadius = UDim.new(0, 4)
+    rBtn.MouseButton1Click:Connect(function()
+        TWEEN_SPEED = 0.18
+        speedLabel.Text = string.format("Tween Speed: %.2fs/step", TWEEN_SPEED)
+    end)
+end
+
+local sep2 = Instance.new("Frame", mainFrame)
+sep2.Size             = UDim2.new(1, -20, 0, 1)
+sep2.Position         = UDim2.new(0, 10, 0, 146)
+sep2.BackgroundColor3 = Color3.fromRGB(40, 40, 50)
+sep2.BorderSizePixel  = 0
+
+local gridContainer = Instance.new("Frame", mainFrame)
+gridContainer.Size             = UDim2.new(1, -20, 1, -158)
+gridContainer.Position         = UDim2.new(0, 10, 0, 150)
+gridContainer.BackgroundTransparency = 1
+
+local cellW, cellH = 19, 19
+local padX, padY   = 3, 2
+
+for r = 1, 20 do
+    uiGridMatrix[r] = {}
+    for t = 1, 10 do
+        local cell = Instance.new("Frame", gridContainer)
+        cell.Size             = UDim2.new(0, cellW, 0, cellH)
+        cell.Position         = UDim2.new(0, (t-1)*(cellW+padX), 0, (20-r)*(cellH+padY))
+        cell.BackgroundColor3 = Color3.fromRGB(12, 12, 15)
+        cell.BorderSizePixel  = 0
+        Instance.new("UICorner", cell).CornerRadius = UDim.new(0, 3)
+        local cs = Instance.new("UIStroke", cell)
+        cs.Color     = Color3.fromRGB(35, 35, 44)
+        cs.Thickness = 0.8
+        uiGridMatrix[r][t] = cell
+    end
+end
+
+resetLogicalGrid()
+
+playerMarkerFrame = Instance.new("Frame", gridContainer)
+playerMarkerFrame.Size             = UDim2.new(0, 15, 0, 14)
+playerMarkerFrame.BackgroundColor3 = Color3.fromRGB(255, 255, 255)
+playerMarkerFrame.ZIndex           = 10
+playerMarkerFrame.Visible          = false
+Instance.new("UICorner", playerMarkerFrame).CornerRadius = UDim.new(1, 0)
+local markerS = Instance.new("UIStroke", playerMarkerFrame)
+markerS.Color     = Color3.fromRGB(0, 240, 255)
+markerS.Thickness = 1.5
+
+local markerL = Instance.new("TextLabel", playerMarkerFrame)
+markerL.Size               = UDim2.new(1, 0, 1, 0)
+markerL.BackgroundTransparency = 1
+markerL.Text               = "P"
+markerL.Font               = Enum.Font.GothamBold
+markerL.TextSize           = 8
+markerL.TextColor3         = Color3.fromRGB(0, 0, 0)
+
+task.spawn(function()
+    updateESP3D()
+    local wasBlocked = false
+
+    while radarEnabled do
+        local blocked = raceBlocker and raceBlocker.CanCollide
+
+        if blocked then
+            if not wasBlocked then
+                wasBlocked = true
+                wasBotRunningBeforeBlock = botRunning
+                botRunning = false
+                if activeTween then activeTween:Cancel() activeTween = nil end
+
+                clearPathLines()
+                resetLogicalGrid()
+                playerMarkerFrame.Visible = false
+
+                botBtn.BackgroundColor3 = Color3.fromRGB(30, 30, 38)
+                botStroke.Color         = Color3.fromRGB(60, 60, 70)
+                botBtn.Text             = "START BOT"
+                botBtn.TextColor3       = Color3.fromRGB(180, 180, 180)
+
+                for _, e in ipairs(activeEsps) do pcall(function() e:Destroy() end) end
+                table.clear(activeEsps)
+                setStatus("Wall active — paused", Color3.fromRGB(255, 80, 80))
+            end
+            task.wait(0.2)
+            continue
+        else
+            if wasBlocked then
+                wasBlocked = false
+                updateESP3D()
+
+                if wasBotRunningBeforeBlock then
+                    wasBotRunningBeforeBlock = false
+                    botRunning = true
+                    botBtn.BackgroundColor3 = Color3.fromRGB(120, 75, 0)
+                    botStroke.Color         = Color3.fromRGB(255, 145, 0)
+                    botBtn.Text             = "STOP BOT"
+                    botBtn.TextColor3       = Color3.new(1, 1, 1)
+                    setStatus("Wall gone — new round!", Color3.fromRGB(50, 220, 100))
+                    task.spawn(runAutoComplete)
+                else
+                    setStatus("Ready", Color3.fromRGB(180, 180, 180))
+                end
+            end
+        end
+
+        if not playerIsStunned then
+            scanEnvironment()
+            clearPathLines()
+
+            local pR, pT = getPlayerGridPosition()
+            local path = calculateSmartPath(pR or 1, pT or 1)
+
+            if #path > 1 then
+                for i = 1, #path - 1 do
+                    local fA = uiGridMatrix[path[i].r]   and uiGridMatrix[path[i].r][path[i].t]
+                    local fB = uiGridMatrix[path[i+1].r] and uiGridMatrix[path[i+1].r][path[i+1].t]
+                    if fA and fB then drawGuiLine(fA, fB, gridContainer) end
+                end
+            end
+        end
+
+        local pR, pT = getPlayerGridPosition()
+        if pR and pT and uiGridMatrix[pR] and uiGridMatrix[pR][pT] then
+            local cell = uiGridMatrix[pR][pT]
+            playerMarkerFrame.Position = UDim2.new(0, cell.Position.X.Offset + 2, 0, cell.Position.Y.Offset + 2)
+            playerMarkerFrame.Visible  = true
+            setCoord(pR, pT)
+        else
+            playerMarkerFrame.Visible = false
+        end
+
+        task.wait(0.05)
+    end
+end)
+
+espBtn.MouseButton1Click:Connect(function()
+    if raceBlocker and raceBlocker.CanCollide then return end
+    espEnabled = not espEnabled
+    espBtn.Text             = espEnabled and "ESP 3D: ON" or "ESP 3D: OFF"
+    espBtn.BackgroundColor3 = espEnabled
+        and Color3.fromRGB(0, 90, 130)
+        or  Color3.fromRGB(40, 40, 48)
+    updateESP3D()
+end)
+
+botBtn.MouseButton1Click:Connect(function()
+    if raceBlocker and raceBlocker.CanCollide then return end
+    botRunning = not botRunning
+    if botRunning then
+        wasBotRunningBeforeBlock = false
+        botBtn.BackgroundColor3 = Color3.fromRGB(120, 75, 0)
+        botStroke.Color         = Color3.fromRGB(255, 145, 0)
+        botBtn.Text             = "STOP BOT"
+        botBtn.TextColor3       = Color3.new(1, 1, 1)
+        task.spawn(runAutoComplete)
+    else
+        wasBotRunningBeforeBlock = false
+        if activeTween then activeTween:Cancel() activeTween = nil end
+        botBtn.BackgroundColor3 = Color3.fromRGB(30, 30, 38)
+        botStroke.Color         = Color3.fromRGB(60, 60, 70)
+        botBtn.Text             = "START BOT"
+        botBtn.TextColor3       = Color3.fromRGB(180, 180, 180)
+        setStatus("Bot stopped", Color3.fromRGB(150, 150, 150))
+    end
+end)
+
+closeBtn.MouseButton1Click:Connect(function()
+    radarEnabled = false
+    espEnabled   = false
+    botRunning   = false
+    wasBotRunningBeforeBlock = false
+    if activeTween then activeTween:Cancel() activeTween = nil end
+    clearPathLines()
+    for _, e in ipairs(activeEsps) do pcall(function() e:Destroy() end) end
+    gui:Destroy()
+end)
+
+do
+    local dragging, dragInput, dragStart, startPos
+    mainFrame.InputBegan:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1 then
+            dragging  = true
+            dragStart = input.Position
+            startPos  = mainFrame.Position
+            input.Changed:Connect(function()
+                if input.UserInputState == Enum.UserInputState.End then dragging = false end
+            end)
+        end
+    end)
+    mainFrame.InputChanged:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseMovement then dragInput = input end
+    end)
+    UIS.InputChanged:Connect(function(input)
+        if input == dragInput and dragging then
+            local delta = input.Position - dragStart
+            mainFrame.Position = UDim2.new(
+                startPos.X.Scale, startPos.X.Offset + delta.X,
+                startPos.Y.Scale, startPos.Y.Offset + delta.Y
+            )
+        end
+    end)
+end
